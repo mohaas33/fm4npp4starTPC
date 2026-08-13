@@ -19,6 +19,51 @@ and — importantly — why this doesn't settle the question. The likely next st
 (training a LoRA adapter on the frozen backbone) is described in
 [Next Steps](#next-steps).
 
+## Quick test
+
+Two commands to check the pipeline actually works on your machine, once
+[Environment setup](#environment-setup) is done.
+
+**Test 1 — convert STAR data → FM4NPP format.** Uses the small real-data
+fixture committed at `tests/fixtures/test_100events.root` (100 events,
+~170 KB), so this works right after cloning — no download needed:
+
+```bash
+python convert_star_to_fm4npp.py \
+    --input tests/fixtures/test_100events.root \
+    --tree T \
+    --output-dir /data/test_conversion_check \
+    --max-events 100 \
+    --overwrite
+```
+
+Expect output ending in `Kept 99 events` (one fixture event genuinely has 0
+hits, same as in the full source file) and `[DONE] Conversion complete.`
+Swap `/data/test_conversion_check` for any writable directory.
+
+**Test 2 — frozen-backbone embedding probe.** This one needs the pretrained
+checkpoint and a full converted STAR dataset of your own — see
+[Getting the checkpoint and input data](#getting-the-checkpoint-and-input-data)
+and [Usage](#usage) below to produce `data/star_fm4npp_2k/`:
+
+```bash
+python extract_embeddings_pca.py \
+    --data-dir data/star_fm4npp_2k \
+    --checkpoint checkpoints/pp_nerf_m3_k30.ckpt \
+    --split train \
+    --n-events 100 \
+    --min-hits 15 \
+    --norm star \
+    --compare-random \
+    --out embeddings_pca.png \
+    --summary-out silhouette_summary.png
+```
+
+Expect a `[RESULT] event ...: silhouette=...` line per event, then a
+`=== SUMMARY ===` block with mean silhouette scores and a Wilcoxon/t-test
+p-value (should roughly match [Results](#results) below), plus two PNGs
+written to the current directory.
+
 ## Repository contents
 
 ```
@@ -51,7 +96,7 @@ __pycache__/
 *.pyc
 ```
 
-The one deliberate exception is `tests/fixtures/*.root`: a small (~136 KB), real
+The one deliberate exception is `tests/fixtures/*.root`: a small (~170 KB), real
 100-event subset of `data/merged_TPCHitsTree.root` (not synthetic — a straight,
 unmodified extraction of the tree's first 100 entries, every branch, same values
 and jagged structure as the source), committed to git so the conversion pipeline
@@ -188,21 +233,9 @@ Sanity-check the output with `test_convertion.py` before moving on.
 
 `tests/fixtures/test_100events.root` is a small, real 100-event subset of
 `data/merged_TPCHitsTree.root` — the source file's first 100 entries, every
-branch, unmodified — committed to git so you can exercise the conversion
-pipeline without the full ~12GB source file:
-
-```bash
-python convert_star_to_fm4npp.py \
-    --input tests/fixtures/test_100events.root \
-    --tree T \
-    --output-dir /tmp/test_conversion_check \
-    --max-events 100 \
-    --overwrite
-```
-
-99 of the 100 events survive the default `--min-hits 1` filter (one has 0
-hits, same as in the full source file); hits/event over the kept events
-range roughly min=3/max=116/mean=52.
+branch, unmodified — committed to git (see [Quick test](#quick-test) above to
+run the conversion pipeline against it right away, no download needed).
+Hits/event over the 99 non-empty events: min=3, max=116, mean≈52.
 
 To regenerate the fixture from a fresh copy of the source file (e.g. after a
 resimulation, or to pull a different/larger slice):
