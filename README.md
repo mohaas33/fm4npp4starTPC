@@ -8,20 +8,28 @@ carry any detectable, transferable physics structure across detectors.
 FM4NPP was never trained on STAR data or STAR geometry. This is a cross-detector
 transfer-learning experiment, not a "just run the pretrained model" exercise.
 
-## Status: negative result so far, at the frozen-embedding stage
+## Status: statistically significant evidence of transfer, with caveats
 
-**TL;DR:** a frozen (untrained) FM4NPP backbone, fed STAR hits under two different
-normalization schemes, shows **no detectable advantage over a randomly initialized
-model of the same architecture** at separating hits by true track ID (n=100 STAR
-events, mean pretrained-vs-random delta ≈ +0.007, distribution straddles zero,
-not statistically significant). See [Results](#results) below for the full picture
-and — importantly — why this doesn't settle the question. The likely next step
-(training a LoRA adapter on the frozen backbone) is described in
-[Next Steps](#next-steps).
+**TL;DR:** under a corrected methodology (real Hierarchical-Raster-Scan point
+ordering + a trained linear probe on top of frozen embeddings, rather than raw
+embeddings under approximate r-sorted ordering), a **pretrained** FM4NPP backbone
+gives significantly better STAR hit-to-track separation than a **randomly
+initialized** model of the same architecture: mean silhouette **0.807 ± 0.129**
+(pretrained) vs **0.716 ± 0.130** (random-init) on held-out STAR test events
+(n=78, mean delta **+0.091 ± 0.059**, Wilcoxon p < 0.0001) — a result now
+checked for seed robustness across 5 independent random-init seeds (all
+positive and significant, mean delta +0.093, seed-to-seed std ~0.010; see
+[Results](#results)). This is real, statistically significant evidence that
+the pretrained weights carry transferable structure — but not proof that STAR
+would match the paper's own reported numbers, and two assumptions remain
+open. See [Results](#results) for the full picture, including an **earlier,
+less rigorous probe that found no effect** and why that methodology was
+misleading, and [Known limitations](#known-limitations) /
+[Next steps](#next-steps) for what's still unverified.
 
 ## Quick test
 
-Two commands to check the pipeline actually works on your machine, once
+Three commands to check the pipeline actually works on your machine, once
 [Environment setup](#environment-setup) is done.
 
 **Test 1 — convert STAR data → FM4NPP format.** Uses the small real-data
@@ -41,8 +49,11 @@ Expect output ending in `Kept 99 events` (one fixture event genuinely has 0
 hits, same as in the full source file) and `[DONE] Conversion complete.`
 Swap `/data/test_conversion_check` for any writable directory.
 
-**Test 2 — frozen-backbone embedding probe.** This one needs the pretrained
-checkpoint and a full converted STAR dataset of your own — see
+**Test 2 — frozen-backbone embedding probe (earlier, superseded methodology).**
+Raw embeddings under approximate r-sorted ordering — kept runnable for history,
+see [Results](#results) for why this specific probe design isn't the one to
+trust. Needs the pretrained checkpoint and a full converted STAR dataset of
+your own — see
 [Getting the checkpoint and input data](#getting-the-checkpoint-and-input-data)
 and [Usage](#usage) below to produce `data/star_fm4npp_2k/`:
 
@@ -61,15 +72,36 @@ python extract_embeddings_pca.py \
 
 Expect a `[RESULT] event ...: silhouette=...` line per event, then a
 `=== SUMMARY ===` block with mean silhouette scores and a Wilcoxon/t-test
-p-value (should roughly match [Results](#results) below), plus two PNGs
-written to the current directory.
+p-value (should roughly match the earlier-methodology numbers in
+[Results](#results) below), plus two PNGs written to the current directory.
+
+**Test 3 — real point ordering + linear probe (current methodology).** The
+result actually worth trusting — see [Results](#results). Also needs the
+checkpoint and a converted STAR dataset:
+
+```bash
+python extract_embeddings_linear_probe.py \
+    --data-dir data/star_fm4npp_2k \
+    --checkpoint checkpoints/pp_nerf_m3_k30.ckpt \
+    --n-fit-events 60 --n-train-events 300 --n-test-events 100 \
+    --norm star --probe-epochs 30 \
+    --out linear_probe_summary.png
+```
+
+Expect per-epoch `[probe] epoch ...: mean triplet loss = ...` lines during
+training (for both the pretrained and random-init models), then a
+`=== SUMMARY (post-linear-probe silhouette, held-out test events) ===` block
+with mean silhouette scores and a Wilcoxon p-value (should roughly match
+[Results](#results) below), plus `linear_probe_summary.png`.
 
 ## Repository contents
 
 ```
 .
 ├── convert_star_to_fm4npp.py   # STAR ROOT TTree -> FM4NPP RaggedMmap format
-├── extract_embeddings_pca.py   # frozen-backbone embedding probe + PCA + stats
+├── extract_embeddings_pca.py   # earlier probe: raw frozen embeddings, r-sorted order (superseded)
+├── star_voxelizer.py           # STAR-adapted Hierarchical Raster Scan point ordering (real Voxelizer)
+├── extract_embeddings_linear_probe.py  # current probe: real point order + trained linear probe
 ├── extract_test_fixture.py     # regenerates tests/fixtures/test_100events.root from the real source file
 ├── test_convertion.py          # sanity checks on converted data
 ├── tests/
@@ -128,9 +160,14 @@ this working — the upstream FM4NPP repo's documentation (`README.md`, `SETUP.m
 - The `Voxelizer`/space-filling-curve point-ordering stat files
   (`bin_edges_v3_nbins_8_8_6.pkl`, `loss_bin_pp.pkl`, `loss_weight_pp.pkl`) referenced
   in the training config are **not included** in the public repo or the checkpoint
-  Google Drive folder. This repo's embedding extraction therefore uses plain
-  r-sorted points instead of the real voxel-serialized order (see
-  [Known Limitations](#known-limitations)).
+  Google Drive folder. The earlier embedding probe (`extract_embeddings_pca.py`)
+  used plain r-sorted points instead of the real voxel-serialized order as a
+  result. `star_voxelizer.py` addresses this by computing STAR-appropriate
+  eta/phi/radius bins directly from data and reconstructing FM4NPP's real
+  `Voxelizer`-based serialization — used by the current probe,
+  `extract_embeddings_linear_probe.py` (see [Results](#results) and
+  [Known limitations](#known-limitations), since two of the `Voxelizer`'s
+  parameters are still unconfirmed assumptions even with this fix).
 
 Everything in this repo was derived by reading FM4NPP's actual source
 (`fm4npp/models/`, `fm4npp/datasets/`, `train/downstream/`), not by trusting its
@@ -257,7 +294,7 @@ an **RNTuple**, not a TTree — unreadable by a stock `root`/PyROOT install and
 a silent behavior change from older uproot. The script uses
 `file.mktree(name, data)` explicitly to get a real TTree instead.
 
-### 2. Frozen-backbone embedding probe
+### 2. Frozen-backbone embedding probe (earlier methodology — superseded)
 
 ```bash
 python extract_embeddings_pca.py \
@@ -284,7 +321,118 @@ paired Wilcoxon/t-test on the deltas.
 `--norm sphenix` keeps FM4NPP's original hardcoded sPHENIX constants, for a
 true-zero-shot comparison.
 
+**This probe's design turned out to be misleading (see [Results](#results)) —
+kept runnable for history, not as the result to cite.** It measures raw
+frozen embeddings under an approximate r-sorted ordering, and the FM4NPP paper
+itself shows raw embeddings aren't expected to separate by track regardless of
+domain transfer. Use the probe below instead.
+
+### 3. Real point ordering + trained linear probe (current methodology)
+
+```bash
+python extract_embeddings_linear_probe.py \
+    --data-dir data/star_fm4npp_2k \
+    --checkpoint checkpoints/pp_nerf_m3_k30.ckpt \
+    --n-fit-events 60 --n-train-events 300 --n-test-events 100 \
+    --norm star --probe-epochs 30 \
+    --out linear_probe_summary.png
+```
+
+Fixes both gaps in the probe above, found by reading the FM4NPP paper's
+appendix directly against its actual code:
+
+1. **Real point ordering.** `star_voxelizer.py` reconstructs FM4NPP's actual
+   Hierarchical Raster Scan serialization (`fm4npp.datasets.voxelizer.Voxelizer`)
+   using STAR-derived eta/phi/radius bins, in place of the plain r-sort
+   approximation above. Eta/phi bins are quantile-binned straight from STAR data
+   (the same algorithm the original `Voxelizer` uses); radius bins use a
+   data-driven density-valley detector (`detect_radial_groups`) as a
+   STAR-appropriate stand-in for the original's hardcoded sPHENIX layer
+   thresholds — see the module docstring for the reasoning.
+2. **A trained linear probe, not raw embeddings.** The FM4NPP paper (Figure 8)
+   states that raw frozen embeddings show "no clear separation among particle
+   tracks" even on the model's own native sPHENIX data — separation only
+   appears after a single trained linear projection. This script trains that
+   one linear layer with a triplet-loss metric-learning objective on frozen
+   embeddings from STAR *training* events, then evaluates silhouette
+   separation on held-out STAR *test* events, for both the pretrained backbone
+   and a random-init control, so the comparison stays fair.
+
+Events are split three ways with no event used in more than one role:
+`--n-fit-events` (default 60) fits the Voxelizer's bins only, `--n-train-events`
+(default 300) trains the linear probe, `--n-test-events` (default 100) is held
+out purely for the final silhouette evaluation reported in
+[Results](#results).
+
+This is still a lighter stand-in for the paper's real downstream head (a
+transformer-decoder instance-segmentation adapter trained with Hungarian
+matching + Dice/Focal/classification losses) — see
+[Known limitations](#known-limitations).
+
 ## Results
+
+### Current methodology: real point ordering + trained linear probe
+
+Run with `--norm star`, 60 fit / 300 train / 100 held-out test STAR events
+(`min-hits=15`), evaluated with the linear probe from
+[Usage §3](#3-real-point-ordering--trained-linear-probe-current-methodology):
+
+| model | mean silhouette (held-out test) |
+|---|---|
+| pretrained + linear probe  | 0.807 ± 0.129 |
+| random-init + linear probe | 0.716 ± 0.130 |
+
+Mean delta (pretrained − random-init): **+0.091 ± 0.059** across n=78 valid
+held-out test events (some of the 100 held out have too few hits or too few
+distinct tracks for silhouette score to be meaningful and are excluded, same
+filter as the earlier probe). Paired Wilcoxon signed-rank test on the
+per-event deltas: **p < 0.0001**. See `linear_probe_summary.png` below for the
+score distributions and per-event delta histogram:
+
+![Linear-probe silhouette summary](linear_probe_summary.png)
+
+**Interpretation:** this is statistically significant evidence that the
+pretrained FM4NPP backbone carries hit-to-track structure that transfers to
+STAR — a real, positive result, not present in the earlier raw-embedding probe
+below. It is **not** evidence that STAR performance would match the paper's
+own reported sPHENIX ARI/efficiency numbers, and (at the time this single run
+was made) it rested on three specific caveats — see the multi-seed check right
+below, which has since resolved one of them.
+
+### Multi-seed robustness check (resolves caveat (c) below)
+
+The single run above used one random-init seed, leaving open the question of
+whether +0.091 reflects pretraining or just a favorable random draw for the
+control model. Resolved by rerunning the identical methodology
+(`--n-fit-events 60 --n-train-events 300 --n-test-events 100 --norm star
+--probe-epochs 30`) end-to-end across 5 independent seeds (`--seed 1`
+through `--seed 5`, logs in `multiseed_runs/log_seed{1..5}.txt`):
+
+| seed | mean delta (pretrained − random-init) | Wilcoxon p |
+|---|---|---|
+| 1 | +0.0778 | < 0.0001 |
+| 2 | +0.0992 | < 0.0001 |
+| 3 | +0.1047 | < 0.0001 |
+| 4 | +0.0978 | < 0.0001 |
+| 5 | +0.0844 | < 0.0001 |
+
+Mean of means: **+0.0928**, std across seeds: **~0.010**. All 5 seeds land
+positive and significant, and the seed-to-seed spread (~0.010) is roughly 5×
+smaller than the within-run std of any individual seed's per-event deltas
+(~0.05) — the gap between pretrained and random-init is stable across
+independent random draws, not an artifact of one favorable control run.
+
+**Status: checked, confirmed robust.** This resolves caveat (c) below —
+kept documented as resolved rather than silently dropped, since it was an
+open question as of the single-run result above. Caveats (a) and (b) remain
+open; see [Known limitations](#known-limitations).
+
+### Earlier methodology (superseded): raw embeddings, approximate r-sorted order
+
+*Kept here for history, not as the result to cite — this was the original
+probe, before closely reading the FM4NPP paper revealed two problems with its
+design (below). Reproduces with the `extract_embeddings_pca.py` command in
+[Quick test](#quick-test) / [Usage §2](#2-frozen-backbone-embedding-probe-earlier-methodology--superseded).*
 
 Run at `n=100` STAR events, `min-hits=15`, both normalization modes:
 
@@ -293,30 +441,71 @@ Run at `n=100` STAR events, `min-hits=15`, both normalization modes:
 | `star`    | ~0.20 | ~0.19 | +0.0074 |
 | `sphenix` | ~0.19 | ~0.19 | +0.0076 |
 
-Both normalization modes give essentially the same near-zero delta, with the
-per-event delta histogram straddling zero in both cases (roughly symmetric mass on
-either side, no statistically significant shift). See `silhouette_summary.png` for
-the full distribution and `embeddings_pca.png` for qualitative per-event PCA plots.
+Both normalization modes gave essentially the same near-zero delta, with the
+per-event delta histogram straddling zero in both cases (roughly symmetric mass
+on either side, not statistically significant):
 
-**Interpretation:** at the frozen, zero-shot embedding stage, this probe finds no
-detectable advantage of the pretrained weights over random initialization for
-separating STAR hits by track. Critically, the fact that both `star` and `sphenix`
-normalization give the *same* null result rules out normalization/domain-gap
-mismatch as the explanation — pointing instead at the point-ordering issue below as
-the more likely cause of the null result.
+![Earlier probe: silhouette summary](silhouette_summary.png)
+![Earlier probe: per-event PCA projections](embeddings_pca.png)
+
+At the time this was read as "no detectable advantage of pretrained weights."
+In hindsight, two problems with the methodology explain the null result rather
+than the pretrained weights actually carrying nothing:
+
+1. It measured **raw** frozen embeddings. The FM4NPP paper's own Figure 8 shows
+   raw embeddings lack clear track separation even in-distribution on native
+   sPHENIX data — separation only emerges after training a single linear
+   projection on top. This probe was never likely to show clustering,
+   regardless of whether the pretrained weights transfer.
+2. It used a **plain r-sort** approximation of point ordering instead of the
+   real Hierarchical Raster Scan the model was actually trained on (the
+   sPHENIX-specific bin-stat files needed to reconstruct that ordering were
+   never published). Mamba is an order-sensitive sequential model, so feeding
+   it a materially different point order than it was trained on can suppress
+   whatever structure the embeddings otherwise carry.
+
+The fact that both `star` and `sphenix` normalization gave the *same* null
+result did correctly rule out normalization/domain-gap mismatch as the
+explanation — it just pointed at the wrong remaining culprit (point ordering
+alone) instead of the combination of both issues above. Both are addressed in
+the current methodology above.
 
 ## Known limitations
 
-- **Missing Voxelizer stat files.** FM4NPP's real data pipeline reorders points
-  via a space-filling-curve/voxel-grouping step before feeding them to the
-  (sequential, Mamba-based) model, using bin-edge statistics
-  (`bin_edges_v3_nbins_8_8_6.pkl`, `loss_bin_pp.pkl`, `loss_weight_pp.pkl`) that are
-  **not included** in the public FM4NPP repo or checkpoint download. This repo
-  substitutes plain r-sorted ordering instead — a genuine code path in FM4NPP's own
-  dataset class, but not what the model was actually trained on. Since Mamba is
-  order-sensitive, this is the leading candidate explanation for the null result
-  above, and should be resolved (e.g. by requesting the missing files from the
-  FM4NPP authors) before treating the negative result as final.
+The current (linear-probe) result above is methodologically much sounder than
+the earlier raw-embedding probe, but it is still not a fully validated
+result. Three specific things were flagged; one is now resolved:
+
+- **(a) Voxelizer ordering parameters are unconfirmed assumptions.**
+  `star_voxelizer.py` computes STAR-specific eta/phi/radius bins directly from
+  data, fixing the missing-`.pkl`-files gap the earlier probe had. But
+  `Voxelizer`'s `dim_sweep_order` and `revert_order` parameters — which also
+  affect the final point order — are left at the class's own defaults
+  (`[0, 1, 2]` / `[0, 1, 2]`) because the real m3/k30 training config was never
+  published; there is no way to recover the true values short of asking the
+  FM4NPP authors. If the current result turns out to be sensitive to this,
+  it's the first parameter worth sweeping.
+- **(b) The linear probe is a lighter stand-in for the paper's real adapter,
+  not a reimplementation of it.** FM4NPP's actual downstream head is a
+  transformer-decoder instance-segmentation adapter trained with Hungarian
+  matching plus Dice/Focal/classification losses (paper Figure 4).
+  `extract_embeddings_linear_probe.py` instead trains a single linear layer
+  with a supervised triplet-loss metric-learning objective — sufficient to
+  show that pretrained embeddings carry transferable structure (which is what
+  silhouette score measures), but not sufficient to claim STAR would reproduce
+  the paper's reported ARI/efficiency numbers.
+- **(c) ~~Single run, single random-init seed.~~ RESOLVED — checked, confirmed
+  robust.** The original concern: the random-init control was one seed of one
+  randomly initialized model, so the +0.091 mean delta might reflect a
+  favorable random draw rather than pretraining. Checked via a 5-seed sweep
+  (see [Results → Multi-seed robustness check](#multi-seed-robustness-check-resolves-caveat-c-below)):
+  all 5 seeds gave a positive, significant delta (+0.078 to +0.105, mean
+  +0.093, seed-to-seed std ~0.010 — about 5× tighter than the per-event
+  spread within any one run). Kept here, marked resolved, rather than removed,
+  since it was an open caveat as of the original single-run result.
+
+Two limitations carried over unchanged from the earlier methodology:
+
 - **`reg_target` is a zero-filled placeholder.** The STAR hit tree used here has no
   per-hit truth momentum/vertex information, so the auxiliary regression target
   FM4NPP's dataset loader expects is filled with zeros. This only matters if you
@@ -327,16 +516,32 @@ the more likely cause of the null result.
 
 ## Next steps
 
-The frozen-embedding probe is a cheap first filter, not a final answer — especially
-given the point-ordering limitation above. The more decisive experiment: freeze the
-pretrained FM4NPP backbone, train a lightweight LoRA adapter + track-finding head on
-top of it using STAR data, and compare against the same adapter/head trained on a
-randomly initialized (from-scratch) backbone. A trainable adapter can compensate for
-ordering/domain mismatches that a purely frozen forward pass cannot, making it a
-fairer test of whether the pretrained weights carry transferable structure. This
-uses FM4NPP's own `train/downstream/track_finding_trainer.py` with
-`mambaversion: mamba2`, `pretrained_ckpt` pointing at the checkpoint above, and
-`use_lora: true`.
+The linear-probe result above is real, statistically significant evidence of
+transfer, now checked for seed-to-seed robustness — but not yet a fully
+validated result. What's actually still open, directly corresponding to the
+remaining caveats in [Known limitations](#known-limitations):
+
+- ~~Multi-seed robustness check (caveat c)~~ — **done**, see
+  [Results → Multi-seed robustness check](#multi-seed-robustness-check-resolves-caveat-c-below):
+  5 seeds, all positive and significant, seed-to-seed std ~0.010. No longer
+  an open item; kept here, struck through, rather than deleted.
+
+1. **Confirm or sweep the Voxelizer's `dim_sweep_order`/`revert_order` (caveat
+   a).** Currently class defaults, not recovered from the real training
+   config. Worth requesting from the FM4NPP authors directly, or sweeping
+   empirically, to rule out that the current result depends on an
+   accidentally-favorable ordering choice.
+2. **Match the paper's real adapter architecture (caveat b).** Replace the
+   triplet-loss linear probe with FM4NPP's actual transformer-decoder
+   instance-segmentation head (Hungarian matching + Dice/Focal/classification
+   losses, `train/downstream/`) to get numbers directly comparable to the
+   paper's reported ARI/efficiency, rather than just a directional signal that
+   transfer exists. This is the natural escalation now that the result has
+   held up across seeds — it uses FM4NPP's own
+   `train/downstream/track_finding_trainer.py` with
+   `mambaversion: mamba2`, `pretrained_ckpt` pointing at the checkpoint above,
+   and (optionally) `use_lora: true` for a lighter-weight fine-tune instead of
+   a full adapter train.
 
 ## Acknowledgments
 
