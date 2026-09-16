@@ -18,11 +18,23 @@ Each event's hits become:
                  Real reg_target values matter only if/when you train with
                  return_reg=True; for the frozen-backbone probe they are
                  never read.
+    pid_target : (N_hits,)   int64     -> ALL ZEROS. FM4NPP's real
+                 fm4npp.datasets.dataset.TPCBatchDataset (used by the real
+                 downstream trainer, train/downstream/track_finding_trainer.py
+                 -- unlike this repo's own probe scripts) unconditionally
+                 loads a pid_target RaggedMmap too, for a particle-ID
+                 auxiliary task unrelated to track-finding. The STAR hit tree
+                 here has no truth particle-ID branch, so this is a
+                 placeholder, added only so the real TPCBatchDataset can be
+                 constructed at all -- nothing in this repo's own scripts
+                 reads it. (TPCBatchDataset also checks for a
+                 mid_target_<split> directory, but that load is wrapped in a
+                 try/except there, so it's optional -- not written here.)
 
 Output layout (mmap_ninja RaggedMmap, matches SETUP.md / dataset_pretrain.py):
     <output_dir>/
-        features_train/     seg_target_train/     reg_target_train/
-        features_test/      seg_target_test/      reg_target_test/
+        features_train/     seg_target_train/     reg_target_train/     pid_target_train/
+        features_test/      seg_target_test/      reg_target_test/      pid_target_test/
 
 Usage:
     python convert_star_to_fm4npp.py \
@@ -114,6 +126,7 @@ def main():
     features_list = []
     seg_target_list = []
     reg_target_list = []
+    pid_target_list = []
     kept_hit_counts = []
     skipped_short = 0
 
@@ -131,10 +144,12 @@ def main():
 
         feat = np.stack([e, x, y, z], axis=-1).astype(np.float32)  # (N,4) = (E,x,y,z)
         reg = np.zeros((n_hits, 7), dtype=np.float32)              # placeholder, see docstring
+        pid = np.zeros((n_hits,), dtype=np.int64)                  # placeholder, see docstring
 
         features_list.append(feat)
         seg_target_list.append(tid)
         reg_target_list.append(reg)
+        pid_target_list.append(pid)
         kept_hit_counts.append(n_hits)
 
         if (i + 1) % 500 == 0 or (i + 1) == n_events:
@@ -166,6 +181,7 @@ def main():
         feat_gen = (features_list[j] for j in idx)
         seg_gen = (seg_target_list[j] for j in idx)
         reg_gen = (reg_target_list[j] for j in idx)
+        pid_gen = (pid_target_list[j] for j in idx)
 
         RaggedMmap.from_generator(
             out_dir=os.path.join(out_dir, f"features_{name}"),
@@ -182,7 +198,13 @@ def main():
             sample_generator=reg_gen,
             batch_size=min(1000, max(1, len(idx))),
         )
-        print(f"[INFO] Wrote '{name}' split: {len(idx)} events -> {out_dir}/{{features,seg_target,reg_target}}_{name}/")
+        RaggedMmap.from_generator(
+            out_dir=os.path.join(out_dir, f"pid_target_{name}"),
+            sample_generator=pid_gen,
+            batch_size=min(1000, max(1, len(idx))),
+        )
+        print(f"[INFO] Wrote '{name}' split: {len(idx)} events -> "
+              f"{out_dir}/{{features,seg_target,reg_target,pid_target}}_{name}/")
 
     write_split("train", train_idx)
     write_split("test", test_idx)
