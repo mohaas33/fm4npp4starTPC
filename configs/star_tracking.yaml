@@ -1,0 +1,171 @@
+# DRAFT -- not yet run. STAR downstream track-finding config for FM4NPP's real
+# adapter (train/downstream/track_finding_trainer.py), modeled directly on
+# FM4NPP's own scripts/configs/mamba_tracking.yaml, with values overridden for:
+#   (a) our checkpoint's real architecture (embed_dim=512 etc., derived from
+#       the checkpoint's own state_dict shapes -- see README.md),
+#   (b) STAR's converted RaggedMmap data and STAR-fitted Voxelizer bins,
+#   (c) the order='EPR' correction verified in this repo (see
+#       linear_probe_summary.png reruns / conversation history -- shrinks but
+#       does not erase the pretrained-vs-random-init silhouette gap).
+#
+# Every value below is either (A) copied unchanged from FM4NPP's own public
+# default config, (B) derived directly from our checkpoint / STAR data (see
+# inline comments), or (C) a STAR-specific placeholder that needs tuning --
+# marked NEEDS-TUNING. Nothing here has been run end-to-end yet.
+
+default_star: &default_star
+  # === Data paths -- fill in for your machine ===
+  data_root: /home/daq/Work/STAR/fm4npp4starTPC/data/star_fm4npp_2k   # NEEDS-VERIFICATION: confirm this
+  data_root_train: /home/daq/Work/STAR/fm4npp4starTPC/data/star_fm4npp_2k  # is the key get_data_loader() actually
+  data_root_test: /home/daq/Work/STAR/fm4npp4starTPC/data/star_fm4npp_2k   # reads -- track_finding_trainer.py
+                                                                            # defines both `data_root` and
+                                                                            # `data_root_train`/`data_root_test`
+                                                                            # in the public yaml; which one(s)
+                                                                            # get_data_loader() uses was not
+                                                                            # traced yet. Set all three to be safe.
+  stat_dir: /home/daq/Work/STAR/fm4npp4starTPC/stats   # NEW -- see export_voxelizer_bins.py below. Must contain
+                                                        # bin_edges_v3_nbins_8_8_6.pkl before this config is used.
+  checkpoint_dir: /home/daq/Work/STAR/fm4npp4starTPC/downstream_checkpoints
+  downstream_dir: /home/daq/Work/STAR/fm4npp4starTPC/downstream_checkpoints
+
+  # === Voxelizer / point ordering ===
+  order: EPR              # (A) FM4NPP's own public default in BOTH mamba_pretrain.yaml and
+                           #     mamba_tracking.yaml -> dim_sweep_order=[2,1,0], revert_order=[2,1,0].
+                           #     Verified in this repo: shrinks the pretrained-vs-random-init silhouette
+                           #     delta from +0.078 to +0.052 (same seed) but keeps p<0.0001 -- real
+                           #     effect on our probe's numbers, not just a documentation nit.
+  voxelize: true           # (A)
+  space_filling_order: false  # (A)
+  space_filling_curve: z       # (A)
+
+  # === Backbone architecture -- (B) derived from pp_nerf_m3_k30.ckpt's own state_dict shapes,
+  #     same values this repo's build_model() already uses successfully in extract_embeddings_linear_probe.py
+  #     and evaluate_tracking.py. headdim/ngroups are NOT separately configurable here --
+  #     MambaGPT.__init__ doesn't expose them; they come from Mamba2's own internal defaults,
+  #     which this repo's own working backbone construction already confirms are compatible.
+  mambaversion: mamba2
+  embed_dim: 512
+  num_layers_backbone: 12
+  d_state: 32
+  klen: 30
+  dropout: 0.0              # frozen/fine-tune eval, not pretraining -- match build_model()'s dropout=0.0
+  embed_method: add          # (A)
+  pe_method: nerf             # (A)
+
+  # === Pretrained checkpoint ===
+  pretrained_ckpt: /home/daq/Work/STAR/fm4npp4starTPC/checkpoints/pp_nerf_m3_k30.ckpt
+  # Confirmed compatible with track_finding_trainer.py's restore_checkpoint(): our .ckpt file
+  # has all 5 keys it expects (iters, epoch, model_state, optimizer_state_dict, scheduler_state_dict).
+  # iters=99000, epoch=2 -- small enough that self.startEpoch won't collide with max_epochs below.
+
+  # === LoRA -- BLOCKED, see notes. Leave false until resolved. ===
+  use_lora: false   # NEEDS-DECISION: track_finding_trainer.py imports `fm4npp.models.lora`
+                     # (apply_lora_to_model, get_lora_params) when use_lora=true -- that module
+                     # does NOT exist anywhere in the cloned public FM4NPP repo. Setting this
+                     # true as-is will crash with ModuleNotFoundError. Options: (1) write a small
+                     # LoRA shim ourselves implementing those two functions against
+                     # in_proj/out_proj/lin_B/lin_C (confirmed to exist under those exact names
+                     # in fm4npp/models/mamba2.py -- the default lora_target_modules already
+                     # matches), (2) leave use_lora=false and accept that the trainer then
+                     # FULLY fine-tunes the backbone by default (see next note) -- itself a
+                     # legitimate, arguably more paper-faithful choice, since LoRA isn't even
+                     # in the public release.
+
+  # NOTE (not a config key, just documenting real trainer behavior found while reading the code):
+  # launch() builds self.optimizer over ALL backbone parameters (grouped by A_log/lin_B/lin_C/else,
+  # each with its own tiny differential LR tied to min_lr) BEFORE the use_lora branch, and nothing
+  # explicitly freezes backbone params otherwise. So with use_lora=false, the real trainer's default
+  # behavior is a FULL backbone fine-tune, not a frozen-backbone probe like this repo's existing
+  # linear-probe/tracking-eval scripts. That's a genuine methodology difference worth deciding on
+  # deliberately, not stumbling into -- see the "what this changes" note below.
+
+  # === Downstream head (MambaAttentionHead) ===
+  num_embedder_layers: 0     # (A) matches track_finding_trainer.py's own inference() call
+  downstream_dropout: 0.1    # NEEDS-VERIFICATION: self.params.downstream_dropout is read directly
+                              # (train/downstream/track_finding_trainer.py's down_model construction)
+                              # but this key is ABSENT from FM4NPP's public mamba_tracking.yaml default
+                              # block -- would raise AttributeError as-is. Added here defensively;
+                              # confirm YParams' actual missing-key behavior before trusting this value.
+  num_heads_backbone: 4       # (A) -- likely unused for mambaversion=mamba2 (only read by the
+                               # longformer/linformer backbone branches), kept for config completeness.
+  num_heads_decoder: 2         # (A)
+  num_heads_encoder: 2         # (A)
+  use_attention_head: true      # (A)
+
+  max_gt_classes: 10   # (C) NEEDS-TUNING, but data-driven: max_gt_classes IS num_prototypes
+                        # (MambaAttentionHead is constructed with num_prototypes=self.params.max_gt_classes
+                        # in track_finding_trainer.py -- NOT a separate "p20"-style knob; that was an
+                        # incorrect guess made before reading this code). FM4NPP's public default is 150,
+                        # sized for busy sPHENIX pp events. Checked STAR's actual per-event track count
+                        # over 2000 sampled events here: max=4, 99th percentile=3, median=2. 150 would be
+                        # wastefully oversized and likely hurts the no-object/matched-class imbalance.
+                        # 10 (2.5x the observed max) is a reasonable starting point, not a paper value.
+
+  # === Loss weights -- (A) copied unchanged from FM4NPP's public default ===
+  loss_matched_ce_weight: 0.5
+  loss_unmatched_ce_weight: 0.1
+  loss_dice_weight: 1
+  loss_focal_weight: 30
+
+  # === Training loop -- (C) scaled down for a single RTX 3070 (8GB) + STAR's much smaller
+  #     dataset (thousands of events, not FM4NPP's 12M), starting from FM4NPP's own defaults ===
+  batch_size: 4              # (A) FM4NPP's own downstream default -- already small
+  valid_batch_size: 1         # (A)
+  max_epochs: 200              # (A) -- NEEDS-TUNING once real STAR event count / epoch time is known
+  max_lr: 0.0001                # (A)
+  min_lr: 0.00001                 # (A)
+  first_cycle_steps: 200            # (A)
+  warmup_steps: 20                   # (A)
+  continue_from_best: true            # (A)
+  return_reg: false                    # (A) -- consistent with reg_target being a zero placeholder here too
+  return_dict: false                    # (A)
+  log_to_screen: true
+  num_data_workers: 4
+
+  # === legacy / required-but-unused keys FM4NPP's own yaml carries forward --
+  #     kept only because YParams / dataset code may still read them ===
+  nleave: 1.0e10
+  len_chunk: 512
+  portion: 0.2
+  chunk_training: false
+  return_reg_test: false
+  grad_clip_value: 0.1
+  rep_aaai: false
+  loss_reweight: false
+  ablate_loss_scale: false
+  save_checkpoint: true
+  group_size: 8
+  init_std: 0.025
+  model_version: downstream_v1
+  data_version: star_2k
+  n_data_idx: 3000
+  n_eval_steps: 200
+  limit_data: false
+
+
+# ============================================================================
+# Pretrained: loads pp_nerf_m3_k30.ckpt (the arm we care about)
+# ============================================================================
+star_m3_k30_pretrained:
+  <<: *default_star
+
+# ============================================================================
+# Random-init control: same everything, no pretrained_ckpt loaded.
+# Mirrors FM4NPP's own public precedent for this exact comparison --
+# mamba_tracking.yaml ships a `mamba_5m_scratch` variant with the comment
+# "No pretrained_ckpt - trains from random initialization" for precisely
+# this pretrained-vs-scratch ablation. This is FM4NPP's own intended way to
+# run the comparison this repo has been making with lighter probes.
+# ============================================================================
+star_m3_k30_scratch:
+  <<: *default_star
+  # NEEDS-IMPLEMENTATION: track_finding_trainer.py's launch() currently calls
+  # restore_checkpoint(self.params.pretrained_ckpt) unconditionally -- there's
+  # no config flag to skip it. FM4NPP's own `mamba_5m_scratch` example config
+  # just omits `pretrained_ckpt` entirely, which would crash launch() as
+  # written (AttributeError on self.params.pretrained_ckpt) unless the trainer
+  # guards that call with getattr(...)/hasattr(...) somewhere not yet found,
+  # or unless we patch launch() to skip restore_checkpoint() when this key is
+  # absent. Needs a one-line trainer patch or an explicit --usepretrain-style
+  # CLI flag (eval_track_finding.py already has one: --no-pretrain) plumbed
+  # into launch() too, not just inference().

@@ -479,6 +479,109 @@ entirely by not using the stock CLI script. None of this has been attempted
 yet — flagged here rather than run, pending a decision on whether it's worth
 the (nontrivial, multi-epoch-training-scale) effort.
 
+**Update: sidestepped rather than resolved.** Instead of fixing the four
+blockers above in FM4NPP's own CLI scripts (`train_track_finding.py`,
+`DownstreamTrainer.launch()`/`.train()`), a separate, much smaller script
+(`eval_track_finding_star.py`) imports the *real model code* those scripts
+also use — `trackinghead.MambaAttentionHead`, `loss.PointHungarianMatcher`,
+`loss.compute_point_loss`, `loss.assign_points_to_masks`, all unmodified —
+and wraps it in its own minimal training/eval loop, the same pattern Steps
+3–4 already use around `MambaGPT`. This avoids all four blockers rather than
+fixing them: no `use_lora`, no `launch()`/`restore_checkpoint()`, no
+`stat_dir` pickle loads, no hardcoded checkpoint dict. See Step 6 below for
+what this actually found.
+
+---
+
+## Step 6: the paper's real adapter — actually run, multi-seed checked
+
+`eval_track_finding_star.py` is the STAR-adapted mimic of FM4NPP's real
+`train/downstream/eval_track_finding.py` workflow described in Step 5 above,
+built by directly importing the paper's real downstream-adapter code rather
+than trying to unblock its own CLI scripts. Per event:
+
+1. Get **all 12 backbone layers'** frozen features (not just the last one,
+   unlike Step 3) — `feature = torch.stack(pre_embed)`, matching exactly what
+   `track_finding_trainer.py` feeds its head.
+2. Feed them into a real `MambaAttentionHead`: a DETR/Mask2Former-style set
+   predictor with `num_prototypes` learned query embeddings that cross-attend
+   to the hits and each predict a class (real-track vs. "no object") and a
+   per-hit mask.
+3. Train it with the real `PointHungarianMatcher` + `compute_point_loss`
+   (classification + Dice + focal losses), on STAR train events, with the
+   backbone kept frozen throughout (same policy as Steps 3–4).
+4. Decode with the real `assign_points_to_masks()`: each hit goes to
+   whichever query scores highest, or is left unassigned if every query says
+   "no object." **No track count is ever given to the model** — unlike Step
+   4's k-means, which is handed the true count as an oracle input.
+
+```python
+# feat_stack: (12, N_hits, 512) frozen backbone features for one event, ALL layers, original hit order
+# lab: (N_hits,) true track id -- from Steps 1-3 above
+outputs, padding_mask = forward_event(down_model, feat_stack, device)          # class_probs, mask_probs
+decoded = assign_points_to_masks(outputs, no_object_class=0, option=2, threshold=0.0)
+assignments = decoded["assignments"][0].cpu().numpy()   # (N_hits,) predicted track id per hit, -1 = unassigned
+ari = adjusted_rand_score(lab, assignments)              # same metric Step 4 reports, oracle-free this time
+```
+
+**Single-seed result** (seed 42, the default; 60 fit / 300 train / 100 test
+events, 30 head-training epochs, backbone frozen):
+
+| metric | pretrained | random-init | delta | Wilcoxon p |
+|---|---|---|---|---|
+| ARI | 0.896 ± 0.271 | 0.795 ± 0.333 | +0.100 | 0.0004 |
+| frac_found (double-majority) | 0.923 ± 0.167 | 0.903 ± 0.211 | +0.020 | 0.206 |
+
+Taken alone, this looks like exactly the confirmation Step 4's ceiling-effect
+diagnosis predicted: remove the oracle track count, and a real, significant
+ARI gap reappears. **But treat that as provisional until multi-seed-checked
+— which, for this method, changes the picture:**
+
+**Multi-seed check** (5 seeds, identical settings otherwise):
+
+| seed | pretrained ARI | random-init ARI | delta | Wilcoxon p |
+|---|---|---|---|---|
+| 42 | 0.896 ± 0.271 | 0.795 ± 0.333 | +0.1001 | 0.0004 |
+| 1 | 0.922 ± 0.231 | 0.913 ± 0.246 | +0.0090 | 0.6095 |
+| 2 | 0.896 ± 0.261 | 0.925 ± 0.218 | **−0.0297** | 0.1126 |
+| 3 | 0.910 ± 0.252 | 0.834 ± 0.314 | +0.0759 | 0.0079 |
+| 4 | 0.870 ± 0.297 | 0.903 ± 0.254 | **−0.0333** | 0.3122 |
+
+Mean of the 5 per-seed deltas: **+0.0244** (std across seeds ≈ **0.0545**) —
+only 2 of 5 seeds individually significant at p<0.05, and the sign flips
+negative in 2 of 5. (frac_found across the same 5 seeds: mean delta
++0.0035, std 0.0116 — essentially no effect, none individually significant —
+consistent with Step 4's finding for that same coarser metric.) With only 5
+seeds this repo's own convention (see README_082026.md) is to not run a
+seed-level significance test at all — n=5 is too small either way.
+
+**Correct framing, not overstated in either direction:** the single-seed
+run's clean p=0.0004 result does **not** replicate robustly — this is a
+different outcome from the silhouette probe's multi-seed check
+(README_082026.md), where all 5 seeds were positive and significant. The
+honest read here is *"weak, seed-dependent evidence of a positive effect on
+ARI under the real, non-oracle adapter — clearly stronger and more often
+positive than Step 4's near-null oracle-k result, but not itself a settled,
+robust finding."* Don't report the seed-42 table's p=0.0004 on its own; don't
+report "no effect" either — both would overstate what 5 noisy, mixed-sign
+seeds actually support.
+
+**A plausible (not paper-stated) reason this is noisier than the silhouette
+probe:** `MambaAttentionHead` has ~3.9M trainable parameters, trained on only
+300 events for 30 epochs — several orders of magnitude more capacity, on
+much less data, than the linear probe's ~33k parameters. Head-training
+variance (a different, freshly-initialized head is trained per arm per seed)
+is plausibly a bigger source of run-to-run noise here than backbone identity
+itself, on top of whatever real transfer effect exists.
+
+**Same standing caveats as Steps 3–5, plus one specific to this method:**
+`num_prototypes=10` and the loss/matcher cost weights are FM4NPP's public
+defaults, not STAR-tuned; the "random-init" arm re-randomizes the whole
+backbone (still not what FM4NPP's own `--usepretrain=False` actually does,
+per Step 5's blocker 2); and the regression/PID/noise auxiliary heads
+`MambaAttentionHead` defines are unused (no truth available for them in the
+STAR conversion).
+
 ---
 
 ## How this lines up with the FM4NPP paper
@@ -494,18 +597,21 @@ the (nontrivial, multi-epoch-training-scale) effort.
 | Linear probe + triplet loss (Step 3) | Paper's real downstream adapter: a transformer-decoder instance-segmentation head trained with Hungarian matching + Dice/Focal/classification losses (paper Fig. 4) | **Lighter stand-in**, motivated directly by the paper's own Fig. 8 finding that a linear projection is the minimum needed to see any separation at all. Not a reimplementation of the real adapter — see Step 5 for a drafted (not yet run) path toward the real one. |
 | Silhouette score (Step 3) | Not in the paper | **This repo's own addition** — a cheap transfer-learning probe, not a paper-reported metric. |
 | k-means + Hungarian double-majority (Step 4) | Paper reports ARI and segmentation efficiency from its *real* adapter's output on sPHENIX | **Same metric names, different machinery** — this repo's numbers use oracle-k clustering on top of the lighter linear probe, not the paper's learned segmentation head, so they are not directly comparable to the paper's own reported ARI/efficiency values. Directionally analogous only. |
-| Real transformer-decoder adapter (Step 5, draft) | The actual thing (paper Fig. 4) | **Drafted, not yet run.** Config (`configs/star_tracking.yaml`) and supporting scripts exist and are individually verified; the real trainer itself hasn't been launched — four concrete code gaps found tracing the actual CLI path (missing LoRA module, no clean from-scratch backbone path, two dead-looking-but-required pickle files, and a hardcoded checkpoint-path dict in the CLI script incompatible with custom configs) need resolving first. |
+| Real transformer-decoder adapter (Step 5 draft; Step 6 run) | The actual thing (paper Fig. 4) | **Run, not just drafted** — but via a standalone script that directly imports the paper's real `MambaAttentionHead`/`PointHungarianMatcher`/`assign_points_to_masks` code, sidestepping (not fixing) the four CLI blockers Step 5 found. Single-seed result looked like a clean, significant pretrained-vs-random-init ARI gap (p=0.0004); the 5-seed check found that doesn't replicate robustly (mean delta +0.024, only 2/5 seeds individually significant, sign flips in 2/5) — see Step 6. |
 
 The short version: Steps 1 and 3's *backbone* are a faithful, code-verified
 reuse of the paper's actual released model and preprocessing. Step 2 fills in
 a genuine gap (missing bin-edge files) with the same algorithm the paper
 describes, on STAR-specific data, and its remaining ordering assumption is
 now corrected against FM4NPP's own public default, not just flagged as
-unknown. Steps 3's *probe* and Step 4's *clustering* are this repo's own,
+unknown. Step 3's *probe* and Step 4's *clustering* are this repo's own,
 deliberately lighter-weight stand-ins for the paper's real downstream
 adapter — built to test *whether* transfer exists cheaply, not to reproduce
-the paper's reported numbers. Step 5 is the drafted, not-yet-run path toward
-closing that last gap with the paper's actual adapter code.
+the paper's reported numbers. Step 6 closes that last gap with the paper's
+actual adapter code (Step 5 documents the CLI path that would have been
+needed to run FM4NPP's own scripts unmodified, and why that was blocked) —
+its multi-seed result is real but weaker and noisier than the single-seed
+run first suggested, not a clean confirmation.
 
 ---
 
@@ -545,12 +651,22 @@ python evaluate_tracking.py \
     --n-plot-events 6 \
     --summary-out tracking_eval_summary.png \
     --events-out tracking_eval_events.png
+
+# Step 6 -- real, oracle-free adapter (MambaAttentionHead), trained + evaluated on STAR
+python eval_track_finding_star.py \
+    --data-dir data/star_fm4npp_2k \
+    --checkpoint checkpoints/pp_nerf_m3_k30.ckpt \
+    --n-fit-events 60 --n-train-events 300 --n-test-events 100 \
+    --head-epochs 30 --seed 42 \
+    --out track_finding_head_summary.png
 ```
 
-Read the printed `Wilcoxon p=` lines before trusting either result, and
-rerun Step 3 across a few `--seed` values before treating any single run's
-delta as settled (see [README_082026.md](README_082026.md) for why that
-matters). Full explanation of what each output means and how much to trust
-it: [README_082026.md](README_082026.md) (silhouette result) and
-[README_091626.md](README_091626.md) (tracking-level result and its
-ceiling-effect caveat).
+Read the printed `Wilcoxon p=` lines before trusting any result, and rerun
+across a few `--seed` values before treating any single run's delta as
+settled — this mattered for Step 3 (5/5 seeds positive, confirmed robust,
+see README_082026.md) and mattered in the *opposite* direction for Step 6
+(single-seed p=0.0004 did not replicate across 5 seeds, see Step 6 above and
+README_091626.md). Full explanation of what each output means and how much
+to trust it: [README_082026.md](README_082026.md) (silhouette result) and
+[README_091626.md](README_091626.md) (tracking-level result, its
+ceiling-effect caveat, and the real-adapter multi-seed check).
